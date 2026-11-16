@@ -1,8 +1,11 @@
+const http = require('http');
 const express = require('express');
 const cheerio = require('cheerio');
+const WebSocket = require('ws');
 const { URL } = require('url');
 
 const app = express();
+const server = http.createServer(app);
 const PORT = process.env.PORT || 8080;
 
 app.use(express.raw({ type: '*/*', limit: '25mb' }));
@@ -46,6 +49,29 @@ const INDEX_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+const cookieJar = new Map();
+
+function getCookiesFor(origin) {
+  const jar = cookieJar.get(origin);
+  if (!jar) return '';
+  return Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function storeCookiesFrom(origin, setCookieHeaders) {
+  if (!setCookieHeaders || !setCookieHeaders.length) return;
+  if (!cookieJar.has(origin)) cookieJar.set(origin, new Map());
+  const jar = cookieJar.get(origin);
+  for (const raw of setCookieHeaders) {
+    const firstPair = raw.split(';').at(0);
+    const eqIdx = firstPair.indexOf('=');
+    if (eqIdx > 0) {
+      const name = firstPair.slice(0, eqIdx).trim();
+      const val = firstPair.slice(eqIdx + 1).trim();
+      jar.set(name, val);
+    }
+  }
+}
+
 function parseCookies(cookieHeader) {
   const list = {};
   if (!cookieHeader) return list;
@@ -86,7 +112,6 @@ app.get('/', (req, res) => {
 
 async function handleProxy(targetUrl, req, res) {
   try {
-    // Store active origin in a cookie so sub-requests never lose context on Vercel or Safari
     res.setHeader(
       'Set-Cookie',
       `__proxy_origin=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=Lax`
@@ -99,6 +124,11 @@ async function handleProxy(targetUrl, req, res) {
       'Origin': targetUrl.origin,
       'Referer': targetUrl.href,
     };
+
+    const savedCookies = getCookiesFor(targetUrl.origin);
+    if (savedCookies) {
+      headers['Cookie'] = savedCookies;
+    }
 
     if (req.headers['content-type'] && req.method !== 'GET' && req.method !== 'HEAD') {
       headers['Content-Type'] = req.headers['content-type'];
@@ -115,6 +145,11 @@ async function handleProxy(targetUrl, req, res) {
     }
 
     const response = await fetch(targetUrl.href, fetchOptions);
+
+    const rawSetCookies = typeof response.headers.getSetCookie === 'function'
+      ? response.headers.getSetCookie()
+      : new Array();
+    storeCookiesFrom(targetUrl.origin, rawSetCookies);
 
     const redirectStatuses = new Array(301, 302, 303, 307, 308);
     if (redirectStatuses.includes(response.status)) {
@@ -160,6 +195,25 @@ async function handleProxy(targetUrl, req, res) {
                 return '/browse?url=' + encodeURIComponent(new URL(u, BASE).href);
               } catch(e) { return u; }
             }
+
+            const OrigWebSocket = window.WebSocket;
+            window.WebSocket = function(url, protocols) {
+              try {
+                const resolved = new URL(url, BASE);
+                if (resolved.protocol === 'http:') resolved.protocol = 'ws:';
+                if (resolved.protocol === 'https:') resolved.protocol = 'wss:';
+                const proxyProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const tunneled = proxyProto + '//' + window.location.host + '/ws?url=' + encodeURIComponent(resolved.href);
+                return protocols ? new OrigWebSocket(tunneled, protocols) : new OrigWebSocket(tunneled);
+              } catch (e) {
+                return protocols ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
+              }
+            };
+            window.WebSocket.prototype = OrigWebSocket.prototype;
+            window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+            window.WebSocket.OPEN = OrigWebSocket.OPEN;
+            window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
+            window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
 
             const origFetch = window.fetch;
             window.fetch = function(input, init) {
@@ -233,9 +287,18 @@ async function handleProxy(targetUrl, req, res) {
         }
       });
 
+      $('script:not([src])').each((_, el) => {
+        let code = $(el).html();
+        if (code) {
+          code = code.replace(/(["'`])(\/(?:_app|_next|assets|static|api|build|chunks)\/[^"'`\s\\]+)\1/g, (m, q, p) => {
+            return `${q}${proxifyUrl(p, targetUrl.href)}${q}`;
+          });
+          $(el).html(code);
+        }
+      });
+
       return res.status(response.status).send($.html());
     }
-
     if (contentType.includes('text/css')) {
       let css = await response.text();
       css = css.replace(/url\((['"]?)(.*?)\1\)/g, (match, quote, assetUrl) => {
@@ -251,6 +314,9 @@ async function handleProxy(targetUrl, req, res) {
       let js = await response.text();
       js = js.replace(/(["'`])(\/(?:_app|_next|assets|static|api|build|chunks)\/[^"'`\s\\]+)\1/g, (match, quote, relPath) => {
         return `${quote}${proxifyUrl(relPath, targetUrl.href)}${quote}`;
+      });
+      js = js.replace(/((?:from|import)\s*\(?\s*["'`])(\.\.?\/[^"'`\s\\]+)(["'`])/g, (match, prefix, relModule, quote) => {
+        return `${prefix}${proxifyUrl(relModule, targetUrl.href)}${quote}`;
       });
       return res.status(response.status).send(js);
     }
@@ -273,14 +339,12 @@ app.all('/browse', async (req, res) => {
   }
 });
 
-// Fallback route: checks Referer first, then falls back to __proxy_origin cookie
 app.use(async (req, res) => {
   if (req.path === '/favicon.ico') {
     return res.status(204).end();
   }
 
   let baseOrigin = null;
-
   const referer = req.headers['referer'];
   if (referer) {
     try {
@@ -309,10 +373,84 @@ app.use(async (req, res) => {
   return res.status(404).send(`Not found: ${req.originalUrl}`);
 });
 
-if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on port ${PORT}`);
-  });
-}
+const wss = new WebSocket.Server({ noServer: true });
 
-module.exports = app;
+server.on('upgrade', (req, socket, head) => {
+  try {
+    const reqUrl = new URL(req.url, `http://${req.headers.host}`);
+    if (reqUrl.pathname !== '/ws') {
+      socket.destroy();
+      return;
+    }
+
+    const targetWsParam = reqUrl.searchParams.get('url');
+    if (!targetWsParam) {
+      socket.destroy();
+      return;
+    }
+
+    const targetWsUrl = new URL(targetWsParam);
+    const savedCookies = getCookiesFor(targetWsUrl.origin.replace(/^ws/, 'http'));
+    const wsHeaders = {
+      'Origin': targetWsUrl.origin.replace(/^ws/, 'http'),
+      'User-Agent': 'Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+    };
+    if (savedCookies) {
+      wsHeaders['Cookie'] = savedCookies;
+    }
+
+    const protocols = req.headers['sec-websocket-protocol']
+      ? req.headers['sec-websocket-protocol'].split(',').map(p => p.trim())
+      : undefined;
+
+    wss.handleUpgrade(req, socket, head, (clientWs) => {
+      const remoteWs = protocols
+        ? new WebSocket(targetWsUrl.href, protocols, { headers: wsHeaders })
+        : new WebSocket(targetWsUrl.href, { headers: wsHeaders });
+
+      const pendingMessages = new Array();
+
+      remoteWs.on('open', () => {
+        while (pendingMessages.length > 0) {
+          const msg = pendingMessages.shift();
+          remoteWs.send(msg.data, { binary: msg.isBinary });
+        }
+      });
+
+      clientWs.on('message', (data, isBinary) => {
+        if (remoteWs.readyState === WebSocket.OPEN) {
+          remoteWs.send(data, { binary: isBinary });
+        } else if (remoteWs.readyState === WebSocket.CONNECTING) {
+          pendingMessages.push({ data, isBinary });
+        }
+      });
+
+      remoteWs.on('message', (data, isBinary) => {
+        if (clientWs.readyState === WebSocket.OPEN) {
+          clientWs.send(data, { binary: isBinary });
+        }
+      });
+
+      clientWs.on('close', () => {
+        if (remoteWs.readyState === WebSocket.OPEN || remoteWs.readyState === WebSocket.CONNECTING) {
+          remoteWs.close();
+        }
+      });
+
+      remoteWs.on('close', () => {
+        if (clientWs.readyState === WebSocket.OPEN || clientWs.readyState === WebSocket.CONNECTING) {
+          clientWs.close();
+        }
+      });
+
+      clientWs.on('error', () => remoteWs.terminate());
+      remoteWs.on('error', () => clientWs.terminate());
+    });
+  } catch {
+    socket.destroy();
+  }
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`HTTP + WebSocket proxy running on port ${PORT}`);
+});
