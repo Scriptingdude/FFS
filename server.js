@@ -5,19 +5,46 @@ const { URL } = require('url');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Parse form submissions & JSON bodies for two-way communication
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.raw({ type: '*/*', limit: '10mb' }));
+// 1. Preserve raw request bodies cleanly for POST/PUT/JSON/Multipart payloads
+app.use(express.raw({ type: '*/*', limit: '25mb' }));
 
-// Serve the iPad touch-friendly UI
+// Simple server-side cookie jar per target origin so logins/sessions persist
+const cookieJar = new Map();
+
+function getCookiesFor(origin) {
+  const jar = cookieJar.get(origin);
+  if (!jar) return '';
+  return Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function storeCookiesFrom(origin, setCookieHeaders) {
+  if (!setCookieHeaders || !setCookieHeaders.length) return;
+  if (!cookieJar.has(origin)) cookieJar.set(origin, new Map());
+  const jar = cookieJar.get(origin);
+  for (const raw of setCookieHeaders) {
+    const firstPair = raw.split(';')[0];
+    const eqIdx = firstPair.indexOf('=');
+    if (eqIdx > 0) {
+      const name = firstPair.slice(0, eqIdx).trim();
+      const val = firstPair.slice(eqIdx + 1).trim();
+      jar.set(name, val);
+    }
+  }
+}
+
 app.get('/', (req, res) => {
   res.sendFile(__dirname + '/index.html');
 });
 
-// Helper to wrap target URLs through our proxy endpoint
 function proxifyUrl(rawUrl, baseUrl) {
-  if (!rawUrl || rawUrl.startsWith('data:') || rawUrl.startsWith('javascript:') || rawUrl.startsWith('#')) {
+  if (
+    !rawUrl ||
+    rawUrl.startsWith('data:') ||
+    rawUrl.startsWith('blob:') ||
+    rawUrl.startsWith('javascript:') ||
+    rawUrl.startsWith('#') ||
+    rawUrl.startsWith('/browse?url=')
+  ) {
     return rawUrl;
   }
   try {
@@ -28,25 +55,20 @@ function proxifyUrl(rawUrl, baseUrl) {
   }
 }
 
-// Main proxy route handling GET, POST, PUT, DELETE
-app.all('/browse', async (req, res) => {
-  const target = req.query.url;
-  if (!target) return res.redirect('/');
-
-  let targetUrl;
-  try {
-    targetUrl = new URL(target.startsWith('http') ? target : `https://${target}`);
-  } catch {
-    return res.status(400).send('Invalid URL');
-  }
-
+async function handleProxy(targetUrl, req, res) {
   try {
     const headers = {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15',
+      'User-Agent': 'Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
       'Accept': req.headers['accept'] || '*/*',
       'Accept-Language': 'en-US,en;q=0.9',
-      'Referer': targetUrl.origin + '/',
+      'Origin': targetUrl.origin,
+      'Referer': targetUrl.href,
     };
+
+    const savedCookies = getCookiesFor(targetUrl.origin);
+    if (savedCookies) {
+      headers['Cookie'] = savedCookies;
+    }
 
     if (req.headers['content-type'] && req.method !== 'GET' && req.method !== 'HEAD') {
       headers['Content-Type'] = req.headers['content-type'];
@@ -58,92 +80,181 @@ app.all('/browse', async (req, res) => {
       redirect: 'manual',
     };
 
-    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
-      if (Buffer.isBuffer(req.body)) {
-        fetchOptions.body = req.body;
-      } else if (typeof req.body === 'object') {
-        fetchOptions.body = new URLSearchParams(req.body).toString();
-      }
+    if (req.method !== 'GET' && req.method !== 'HEAD' && Buffer.isBuffer(req.body) && req.body.length > 0) {
+      fetchOptions.body = req.body;
     }
 
     const response = await fetch(targetUrl.href, fetchOptions);
 
-    // Handle HTTP redirects cleanly so Safari stays inside the proxy
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
+    // Save Set-Cookie headers from destination server
+    const rawSetCookies = typeof response.headers.getSetCookie === 'function'
+      ? response.headers.getSetCookie()
+      : [];
+    storeCookiesFrom(targetUrl.origin, rawSetCookies);
+
+    // Handle HTTP 301/302/303/307/308 redirects safely
+    const redirectStatuses =;
+    if (redirectStatuses.includes(response.status)) {
       const location = response.headers.get('location');
       if (location) {
-        return res.redirect(proxifyUrl(location, targetUrl.href));
+        return res.redirect(response.status, proxifyUrl(location, targetUrl.href));
       }
     }
 
     const contentType = response.headers.get('content-type') || 'application/octet-stream';
 
-    // Strip headers that block iframes or force downloads
+    // Strip headers that block execution, CORS, or iframe embedding
     res.setHeader('Content-Type', contentType);
+    res.setHeader('Access-Control-Allow-Origin', '*');
     res.removeHeader('X-Frame-Options');
     res.removeHeader('Content-Security-Policy');
+    res.removeHeader('Content-Security-Policy-Report-Only');
+    res.removeHeader('Cross-Origin-Opener-Policy');
+    res.removeHeader('Cross-Origin-Embedder-Policy');
     res.removeHeader('Content-Disposition');
 
-    // Rewrite HTML pages
+    // Rewrite HTML documents
     if (contentType.includes('text/html')) {
       const html = await response.text();
       const $ = cheerio.load(html);
 
-      // Inject client-side interceptor for dynamic fetch(), XHR, and window.open()
+      // Remove <meta http-equiv="Content-Security-Policy"> tags inside HTML
+      $('meta[http-equiv="Content-Security-Policy"]').remove();
+      $('meta[http-equiv="X-Frame-Options"]').remove();
+
+      // Strip integrity/crossorigin attributes that break rewritten scripts/CSS
+      $('[integrity]').removeAttr('integrity');
+      $('[crossorigin]').removeAttr('crossorigin');
+
       const interceptorScript = `
         <script>
           (function() {
             const BASE = ${JSON.stringify(targetUrl.href)};
             function wrap(u) {
               if (!u || typeof u !== 'string') return u;
-              if (u.startsWith('/browse?url=') || u.startsWith('data:') || u.startsWith('blob:') || u.startsWith('javascript:')) return u;
+              if (
+                u.startsWith('/browse?url=') ||
+                u.startsWith('data:') ||
+                u.startsWith('blob:') ||
+                u.startsWith('javascript:') ||
+                u.startsWith('#')
+              ) return u;
               try {
                 return '/browse?url=' + encodeURIComponent(new URL(u, BASE).href);
               } catch(e) { return u; }
             }
+
+            // Intercept fetch()
             const origFetch = window.fetch;
             window.fetch = function(input, init) {
               if (typeof input === 'string') input = wrap(input);
-              else if (input && input.url) input = new Request(wrap(input.url), input);
+              else if (input instanceof Request) input = new Request(wrap(input.url), input);
               return origFetch.call(this, input, init);
             };
+
+            // Intercept XMLHttpRequest
             const origOpen = XMLHttpRequest.prototype.open;
             XMLHttpRequest.prototype.open = function(method, url, ...rest) {
               return origOpen.call(this, method, wrap(url), ...rest);
             };
-            window.open = function(url) {
-              if (url) window.location.href = wrap(url);
+
+            // Intercept dynamically created <script>, <img>, <link>, <iframe> tags
+            const origSetAttr = Element.prototype.setAttribute;
+            Element.prototype.setAttribute = function(name, value) {
+              const lower = String(name).toLowerCase();
+              if ((lower === 'src' || lower === 'href' || lower === 'action') && typeof value === 'string') {
+                value = wrap(value);
+              }
+              return origSetAttr.call(this, name, value);
+            };
+
+            // Intercept direct property assignments like script.src = "..."
+            [HTMLScriptElement, HTMLImageElement, HTMLLinkElement, HTMLIFrameElement].forEach((El) => {
+              if (!El || !El.prototype) return;
+              const prop = El === HTMLLinkElement ? 'href' : 'src';
+              const desc = Object.getOwnPropertyDescriptor(El.prototype, prop);
+              if (desc && desc.set) {
+                Object.defineProperty(El.prototype, prop, {
+                  get: desc.get,
+                  set: function(val) { return desc.set.call(this, wrap(val)); }
+                });
+              }
+            });
+
+            // Protect SPA client-side routers
+            const origPush = history.pushState;
+            history.pushState = function(state, title, url) {
+              if (url) return origPush.call(this, state, title, wrap(url));
+              return origPush.apply(this, arguments);
+            };
+            const origReplace = history.replaceState;
+            history.replaceState = function(state, title, url) {
+              if (url) return origReplace.call(this, state, title, wrap(url));
+              return origReplace.apply(this, arguments);
             };
           })();
         </script>
       `;
       $('head').prepend(interceptorScript);
 
-      // Rewrite static HTML attributes
       $('[href]').each((_, el) => $(el).attr('href', proxifyUrl($(el).attr('href'), targetUrl.href)));
       $('[src]').each((_, el) => $(el).attr('src', proxifyUrl($(el).attr('src'), targetUrl.href)));
       $('form[action]').each((_, el) => $(el).attr('action', proxifyUrl($(el).attr('action'), targetUrl.href)));
 
-      return res.send($.html());
+      // Rewrite srcset for responsive images
+      $('[srcset]').each((_, el) => {
+        const srcset = $(el).attr('srcset');
+        if (srcset) {
+          const rewritten = srcset.split(',').map(part => {
+            const trimmed = part.trim();
+            const [urlPart, descriptor] = trimmed.split(/\s+/);
+            return descriptor ? `${proxifyUrl(urlPart, targetUrl.href)} ${descriptor}` : proxifyUrl(urlPart, targetUrl.href);
+          }).join(', ');
+          $(el).attr('srcset', rewritten);
+        }
+      });
+
+      return res.status(response.status).send($.html());
     }
 
-    // Rewrite CSS url(...) references
+    // Rewrite CSS url(...) and @import rules
     if (contentType.includes('text/css')) {
       let css = await response.text();
       css = css.replace(/url\((['"]?)(.*?)\1\)/g, (match, quote, assetUrl) => {
         return `url(${quote}${proxifyUrl(assetUrl, targetUrl.href)}${quote})`;
       });
-      return res.send(css);
+      css = css.replace(/@import\s+(['"])(.*?)\1/g, (match, quote, importUrl) => {
+        return `@import ${quote}${proxifyUrl(importUrl, targetUrl.href)}${quote}`;
+      });
+      return res.status(response.status).send(css);
     }
 
-    // Stream images, fonts, and JS files directly
+    // Rewrite root-relative paths inside JavaScript bundles (e.g. "/_app/...", "/api/...")
+    if (contentType.includes('javascript') || contentType.includes('ecmascript')) {
+      let js = await response.text();
+      js = js.replace(/(["'`])(\/(?:_app|_next|assets|static|api|build|chunks)\/[^"'`\s\\]+)\1/g, (match, quote, relPath) => {
+        return `${quote}${proxifyUrl(relPath, targetUrl.href)}${quote}`;
+      });
+      return res.status(response.status).send(js);
+    }
+
+    // Stream binary assets (images, fonts, wasm, audio) with original status code
     const buffer = Buffer.from(await response.arrayBuffer());
-    res.send(buffer);
+    return res.status(response.status).send(buffer);
   } catch (err) {
-    res.status(502).send(`Proxy error: ${err.message}`);
+    return res.status(502).send(`Proxy error: ${err.message}`);
+  }
+}
+
+app.all('/browse', async (req, res) => {
+  const target = req.query.url;
+  if (!target) return res.redirect('/');
+  try {
+    const targetUrl = new URL(target.startsWith('http') ? target : `https://${target}`);
+    return handleProxy(targetUrl, req, res);
+  } catch {
+    return res.status(400).send('Invalid URL');
   }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// Catch-all fallback for dynamic module imports & root-relative requests
