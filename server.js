@@ -39,39 +39,26 @@ const INDEX_HTML = `<!DOCTYPE html>
       let val = input.value.trim();
       if (!val) return;
       if (!val.startsWith('http://') && !val.startsWith('https://')) val = 'https://' + val;
+      document.cookie = '__proxy_origin=' + encodeURIComponent(new URL(val).origin) + '; path=/; SameSite=Lax';
       frame.src = '/browse?url=' + encodeURIComponent(val);
     }
   </script>
 </body>
 </html>`;
 
-const cookieJar = new Map();
-
-function getCookiesFor(origin) {
-  const jar = cookieJar.get(origin);
-  if (!jar) return '';
-  return Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
-}
-
-function storeCookiesFrom(origin, setCookieHeaders) {
-  if (!setCookieHeaders || !setCookieHeaders.length) return;
-  if (!cookieJar.has(origin)) cookieJar.set(origin, new Map());
-  const jar = cookieJar.get(origin);
-  for (const raw of setCookieHeaders) {
-    const firstPair = raw.split(';').at(0);
-    const eqIdx = firstPair.indexOf('=');
-    if (eqIdx > 0) {
-      const name = firstPair.slice(0, eqIdx).trim();
-      const val = firstPair.slice(eqIdx + 1).trim();
-      jar.set(name, val);
+function parseCookies(cookieHeader) {
+  const list = {};
+  if (!cookieHeader) return list;
+  cookieHeader.split(';').forEach((cookie) => {
+    const idx = cookie.indexOf('=');
+    if (idx > 0) {
+      const key = cookie.slice(0, idx).trim();
+      const val = cookie.slice(idx + 1).trim();
+      list[key] = decodeURIComponent(val);
     }
-  }
+  });
+  return list;
 }
-
-app.get('/', (req, res) => {
-  res.setHeader('Content-Type', 'text/html');
-  res.send(INDEX_HTML);
-});
 
 function proxifyUrl(rawUrl, baseUrl) {
   if (
@@ -92,8 +79,19 @@ function proxifyUrl(rawUrl, baseUrl) {
   }
 }
 
+app.get('/', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.status(200).send(INDEX_HTML);
+});
+
 async function handleProxy(targetUrl, req, res) {
   try {
+    // Store active origin in a cookie so sub-requests never lose context on Vercel or Safari
+    res.setHeader(
+      'Set-Cookie',
+      `__proxy_origin=${encodeURIComponent(targetUrl.origin)}; Path=/; SameSite=Lax`
+    );
+
     const headers = {
       'User-Agent': 'Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
       'Accept': req.headers['accept'] || '*/*',
@@ -101,11 +99,6 @@ async function handleProxy(targetUrl, req, res) {
       'Origin': targetUrl.origin,
       'Referer': targetUrl.href,
     };
-
-    const savedCookies = getCookiesFor(targetUrl.origin);
-    if (savedCookies) {
-      headers['Cookie'] = savedCookies;
-    }
 
     if (req.headers['content-type'] && req.method !== 'GET' && req.method !== 'HEAD') {
       headers['Content-Type'] = req.headers['content-type'];
@@ -122,11 +115,6 @@ async function handleProxy(targetUrl, req, res) {
     }
 
     const response = await fetch(targetUrl.href, fetchOptions);
-
-    const rawSetCookies = typeof response.headers.getSetCookie === 'function'
-      ? response.headers.getSetCookie()
-      : new Array();
-    storeCookiesFrom(targetUrl.origin, rawSetCookies);
 
     const redirectStatuses = new Array(301, 302, 303, 307, 308);
     if (redirectStatuses.includes(response.status)) {
@@ -285,20 +273,40 @@ app.all('/browse', async (req, res) => {
   }
 });
 
+// Fallback route: checks Referer first, then falls back to __proxy_origin cookie
 app.use(async (req, res) => {
+  if (req.path === '/favicon.ico') {
+    return res.status(204).end();
+  }
+
+  let baseOrigin = null;
+
   const referer = req.headers['referer'];
   if (referer) {
     try {
       const refUrl = new URL(referer);
       const proxiedTarget = refUrl.searchParams.get('url');
       if (proxiedTarget) {
-        const baseTarget = new URL(proxiedTarget);
-        const resolvedTarget = new URL(req.originalUrl, baseTarget.origin);
-        return handleProxy(resolvedTarget, req, res);
+        baseOrigin = new URL(proxiedTarget).origin;
       }
     } catch {}
   }
-  return res.status(404).send('Not found');
+
+  if (!baseOrigin) {
+    const cookies = parseCookies(req.headers['cookie']);
+    if (cookies.__proxy_origin) {
+      baseOrigin = cookies.__proxy_origin;
+    }
+  }
+
+  if (baseOrigin) {
+    try {
+      const resolvedTarget = new URL(req.originalUrl, baseOrigin);
+      return handleProxy(resolvedTarget, req, res);
+    } catch {}
+  }
+
+  return res.status(404).send(`Not found: ${req.originalUrl}`);
 });
 
 if (require.main === module) {
